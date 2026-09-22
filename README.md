@@ -23,6 +23,10 @@ Markdown 文档，服务解析相对链接、标题锚点与代码块，建立�
 - **结果对比**：对两次 `done` 状态的校验，按稳定指纹（`type`、`severity`、
   `path`、`line`、`message`、`details`）计算新增 / 移除 / 未变化诊断，并报告
   两次导入之间文档的新增、删除与内容变化路径（`POST /api/validations/compare`）。
+- **质量门禁**：按诊断类型设置忽略后的 error/warning 计数上限，并提供
+  可忽略规则（诊断类型、路径 glob、消息正则）；服务以稳定优先级裁决规则冲突，
+  返回 pass/fail、原始与忽略后计数、命中规则及未通过诊断
+  （`POST /api/validations/{validation_id}/gate`）。
 - **修复预览**：返回受影响文档的逐行变更与完整修复后内容，**不改写代码块与正文**：
   - 锚点碰撞 → 为重复标题补充显式锚点 `{#id}`（尽量保持原锚点值不变）；
   - 断锚 → 以最相似的目标锚点重写引用片段（相似度阈值 0.6）；
@@ -91,6 +95,7 @@ pytest
 | `GET` | `/api/validations/{validation_id}` | 任务状态 + 诊断（`?type=`、`?path=` 过滤） |
 | `POST` | `/api/validations/compare` | 对比两次校验的诊断与文档差异（均须为 `done`） |
 | `GET` | `/api/validations/{validation_id}/sarif` | SARIF 2.1.0 导出（任务须为 `done`） |
+| `POST` | `/api/validations/{validation_id}/gate` | 质量门禁评估：阈值 + 忽略规则 → pass/fail（任务须为 `done`） |
 | `POST` | `/api/validations/{validation_id}/fix-preview` | 修复预览（任务须为 `done`） |
 
 ### 示例
@@ -123,6 +128,15 @@ curl -X POST localhost:8000/api/validations/compare \
 
 # 6. SARIF 2.1.0 导出（Content-Type: application/sarif+json）
 curl localhost:8000/api/validations/<validation_id>/sarif -o results.sarif
+
+# 7. 质量门禁
+curl -X POST localhost:8000/api/validations/<validation_id>/gate \
+  -H 'Content-Type: application/json' -d '{
+    "thresholds": {"broken_link": {"error": 0}, "cycle": {"warning": 2}},
+    "ignore_rules": [
+      {"name": "docs-glob", "path_glob": "docs/**"},
+      {"message_regex": "nope\\.md"}
+    ]}'
 ```
 
 修复预览响应：
@@ -212,6 +226,77 @@ VS Code SARIF Viewer 等工具：
 - 仅 `done` 状态可导出：校验不存在返回 `404`，`pending`/`running`/`failed`
   返回 `409` 并在 `detail` 中说明当前状态。
 
+## 质量门禁
+
+`POST /api/validations/{validation_id}/gate` 对一次 `done` 状态的校验执行
+"先忽略、再计阈值"的门禁评估。请求体（两个字段均可省略，空请求恒为 pass）：
+
+```json
+{
+  "thresholds": {
+    "broken_link": {"error": 0, "warning": 0},
+    "broken_anchor": {"error": 2},
+    "cycle": {"warning": 5}
+  },
+  "ignore_rules": [
+    {"name": "允许 docs 目录的断链", "path_glob": "docs/**", "type": "broken_link"},
+    {"message_regex": "legacy/.*\\.md"},
+    {"path_glob": "**/drafts/*.md"}
+  ]
+}
+```
+
+- **阈值 `thresholds`**：按诊断类型（`broken_link` / `broken_anchor` /
+  `anchor_collision` / `cycle`，未知类型按 0 条计数）分别给出忽略后允许的
+  最大诊断数，键为 `error` / `warning`，可只给其一；`actual > threshold`
+  即判定未通过（相等仍为 pass）。
+- **忽略规则 `ignore_rules`**：每条规则支持四个可选字段 `name`、`type`、
+  `path_glob`、`message_regex`；**所有已给条件同时满足**才命中（AND 语义），
+  无任何条件的规则忽略全部诊断。
+  - `path_glob`：POSIX 风格 glob，`*` 匹配单层任意字符（不含 `/`）、`?`
+    匹配单个非 `/` 字符、`**` 跨任意层级目录（`docs/**/g.md` 同时匹配
+    `docs/g.md` 与 `docs/a/b/g.md`）、支持 `[abc]` 字符类；
+  - `message_regex`：Python 正则，以 `re.search` 子串匹配诊断消息。
+- **规则冲突裁决**（每条诊断至多被一条规则忽略，按稳定优先级取最高者）：
+  1. 路径 glob 更具体者优先（有路径约束 > 无路径约束；字面目录层级更多 >
+     字面前缀更长 > 通配符更少；纯字面路径最具体）；
+  2. 指定 `type` 的规则优先于不限类型的规则；
+  3. 以上均相同时，按请求中的提交顺序（靠前优先）。
+
+响应给出原始计数、忽略后计数、每条实际命中规则（按提交顺序）及各阈值评估
+结果；`failing_diagnostics` 仅包含真正导致未通过的诊断（即未被忽略、且所属
+类型+级别桶超过阈值者），并按（路径、行号、类型、消息）确定性排序：
+
+```json
+{
+  "validation_id": "…",
+  "status": "fail",
+  "passed": false,
+  "counts": {
+    "raw": {"total": 8, "error": 4, "warning": 4,
+            "by_type": {"broken_link": {"total": 2, "error": 2, "warning": 0}}},
+    "after_ignore": {"total": 6, "error": 3, "warning": 3,
+                     "by_type": {"broken_link": {"total": 1, "error": 1, "warning": 0}}},
+    "ignored": 2
+  },
+  "violations": [
+    {"type": "broken_link", "severity": "error", "threshold": 0, "actual": 1}
+  ],
+  "matched_rules": [
+    {"rule_index": 0, "name": "允许 docs 目录的断链", "ignored_count": 1}
+  ],
+  "failing_diagnostics": [
+    {"type": "broken_link", "severity": "error", "path": "index.md", "line": 3,
+     "message": "link target 'docs/nope.md' does not match any imported document",
+     "details": {"target": "docs/nope.md", "resolved": "docs/nope.md"}}
+  ]
+}
+```
+
+错误处理：校验不存在返回 `404`；`pending`/`running`/`failed` 状态返回 `409`；
+非法 `message_regex` / `path_glob`（含未闭合的 `[...]`）、负阈值、空字符串
+条件以及未知请求字段均返回 `422`。同一配置重复评估结果逐字节一致。
+
 ## 解析规则与已知限制
 
 - 锚点生成遵循 GitHub 规则：小写、去标点、空白转 `-`，重复标题自动追加 `-1`、`-2`；
@@ -233,6 +318,7 @@ app/
   analyzer.py  # 引用图构建与诊断（断链/断锚/碰撞/环）
   comparison.py# 两次校验结果对比：诊断指纹差分 + 文档集合差分
   fixer.py     # 修复预览：最小化重写锚点与引用
+  gate.py      # 质量门禁：glob/正则忽略规则匹配 + 阈值判定
   sarif.py     # SARIF 2.1.0 导出：诊断 -> runs/results 映射
   db.py        # SQLite 持久层（imports / documents / validations / diagnostics）
   schemas.py   # 请求模型与路径校验

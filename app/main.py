@@ -10,8 +10,10 @@ from . import db
 from .analyzer import analyze
 from .comparison import build_comparison
 from .fixer import build_fix_preview
+from .gate import evaluate_gate
 from .sarif import build_sarif
 from .schemas import (
+    GateRequest,
     ImportRequest,
     ValidationCompareRequest,
     ValidationRequest,
@@ -214,6 +216,20 @@ def export_validation_sarif(validation_id: str) -> Response:
     return Response(
         content=json.dumps(report, ensure_ascii=False),
         media_type=SARIF_MEDIA_TYPE,
+    )
+
+
+# ------------------------------------------------------------------- gate ---
+
+@app.post("/api/validations/{validation_id}/gate")
+def quality_gate(validation_id: str, req: GateRequest) -> dict:
+    v = _require_done_validation(validation_id, "quality gate evaluation")
+    diagnostics = db.list_diagnostics(validation_id)
+    return evaluate_gate(
+        validation_id=v["id"],
+        diagnostics=diagnostics,
+        thresholds=req.thresholds,
+        ignore_rules=req.ignore_rules,
     )
 
 
