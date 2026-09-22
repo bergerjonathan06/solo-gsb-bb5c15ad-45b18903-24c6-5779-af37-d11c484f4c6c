@@ -1,0 +1,1 @@
+"""Markdown reference-closure validator."""
