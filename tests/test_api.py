@@ -739,3 +739,352 @@ def test_sarif_requires_done_status(client):
     r = client.get(f"/api/validations/{vid}/sarif")
     assert r.status_code == 409
     assert "failed" in r.json()["detail"]
+
+
+# ------------------------------------------------------------------ gate ---
+
+def gate(client, vid, payload):
+    return client.post(f"/api/validations/{vid}/gate", json=payload)
+
+
+def test_gate_without_configuration_passes_and_reports_raw_counts(client):
+    _, vid, body = import_and_validate(client, CORPUS)
+    r = gate(client, vid, {})
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["status"] == "pass"
+    assert j["passed"] is True
+    assert j["matched_rules"] == []
+    assert j["ignored_diagnostics"] == []
+    assert j["threshold_checks"] == []
+    assert j["failing"] == []
+    assert j["raw_counts"] == {
+        "error": {
+            "anchor_collision": 0,
+            "broken_anchor": 2,
+            "broken_link": 2,
+            "cycle": 0,
+        },
+        "warning": {
+            "anchor_collision": 1,
+            "broken_anchor": 0,
+            "broken_link": 0,
+            "cycle": 3,
+        },
+    }
+    assert j["ignored_counts"] == {
+        sev: {t: 0 for t in body["summary"]["by_type"]}
+        for sev in ("error", "warning")
+    }
+    assert j["counts"] == {"raw": 8, "ignored": 0, "effective": 8}
+
+
+def test_gate_threshold_boundary_pass_and_fail(client):
+    _, vid, _ = import_and_validate(client, CORPUS)
+
+    # exactly at the threshold passes; one above fails
+    r = gate(client, vid, {"thresholds": {"broken_link": {"error": 2}}})
+    assert r.status_code == 200
+    assert r.json()["status"] == "pass"
+
+    r = gate(client, vid, {"thresholds": {"broken_link": {"error": 1}}})
+    j = r.json()
+    assert j["status"] == "fail"
+    assert j["passed"] is False
+    assert j["threshold_checks"] == [
+        {"type": "broken_link", "severity": "error", "threshold": 1, "count": 2, "pass": False}
+    ]
+    assert len(j["failing"]) == 1
+    bucket = j["failing"][0]
+    assert bucket["type"] == "broken_link"
+    assert bucket["severity"] == "error"
+    assert bucket["threshold"] == 1
+    assert bucket["count"] == 2
+    failing_diags = bucket["diagnostics"]
+    assert {(d["path"], d["line"]) for d in failing_diags} == {
+        ("index.md", 3),
+        ("docs/guide.md", 9),
+    }
+    for d in failing_diags:
+        assert set(d) == {"type", "severity", "path", "line", "message", "details"}
+    # failing diagnostics inherit the (path, line, type, message) ordering
+    assert [d["path"] for d in failing_diags] == ["docs/guide.md", "index.md"]
+
+
+def test_gate_warning_threshold_is_severity_scoped(client):
+    _, vid, _ = import_and_validate(client, CORPUS)
+    # cycle is warning-severity even though 3 exist; error threshold unaffected
+    r = gate(client, vid, {"thresholds": {"cycle": {"error": 0, "warning": 3}}})
+    assert r.json()["status"] == "pass"
+    r = gate(client, vid, {"thresholds": {"cycle": {"warning": 2}}})
+    j = r.json()
+    assert j["status"] == "fail"
+    assert j["failing"][0]["count"] == 3
+    assert {d["path"] for d in j["failing"][0]["diagnostics"]} == {
+        "index.md",
+        "docs/guide.md",
+        "docs/api.md",
+    }
+    # doc-level diagnostics (line=None) sort before line-based ones within a bucket
+    assert all(d["line"] is None for d in j["failing"][0]["diagnostics"])
+
+
+def test_gate_multiple_thresholds_aggregated(client):
+    _, vid, _ = import_and_validate(client, CORPUS)
+    r = gate(
+        client,
+        vid,
+        {
+            "thresholds": {
+                "broken_link": {"error": 0},
+                "broken_anchor": {"error": 0},
+                "cycle": {"warning": 5},
+            }
+        },
+    )
+    j = r.json()
+    assert j["status"] == "fail"
+    assert {(f["type"], f["severity"]) for f in j["failing"]} == {
+        ("broken_link", "error"),
+        ("broken_anchor", "error"),
+    }
+    checks = {(c["type"], c["severity"], c["pass"]) for c in j["threshold_checks"]}
+    assert checks == {
+        ("broken_anchor", "error", False),
+        ("broken_link", "error", False),
+        ("cycle", "warning", True),
+    }
+
+
+def test_gate_ignore_by_type_glob_and_regex(client):
+    _, vid, _ = import_and_validate(client, CORPUS)
+    r = gate(
+        client,
+        vid,
+        {
+            "thresholds": {"broken_link": {"error": 0}, "cycle": {"warning": 0}},
+            "ignore_rules": [
+                {"type": "cycle"},                              # all cycle warnings
+                {"path_glob": "docs/*.md", "type": "broken_link"},
+                {"message_regex": r"does not match"},          # guide.md broken link
+            ],
+        },
+    )
+    j = r.json()
+    assert j["status"] == "pass", j
+    assert j["counts"] == {"raw": 8, "ignored": 5, "effective": 3}
+    assert j["ignored_counts"]["error"]["broken_link"] == 2
+    assert j["ignored_counts"]["warning"]["cycle"] == 3
+    hits = {m["rule_index"]: m["matched_count"] for m in j["matched_rules"]}
+    assert hits == {0: 3, 1: 1, 2: 1}
+    ignored_by = {(d["path"], d["line"]): d["ignored_by"] for d in j["ignored_diagnostics"]}
+    # guide.md broken link is claimed by the path-specific rule 1 even though
+    # the broad message regex (rule 2) also matches
+    assert ignored_by[("docs/guide.md", 9)] == 1
+    assert ignored_by[("index.md", 3)] == 2
+    assert {
+        (d["path"], d["line"])
+        for d in j["ignored_diagnostics"]
+        if d["ignored_by"] == 0
+    } == {("index.md", None), ("docs/guide.md", None), ("docs/api.md", None)}
+
+
+def test_gate_ignored_diagnostics_are_excluded_from_threshold(client):
+    _, vid, _ = import_and_validate(client, CORPUS)
+    r = gate(
+        client,
+        vid,
+        {
+            "thresholds": {"broken_link": {"error": 0}},
+            "ignore_rules": [
+                {"type": "broken_link", "path_glob": "**"},  # both broken links
+            ],
+        },
+    )
+    j = r.json()
+    assert j["status"] == "pass"
+    assert j["threshold_checks"][0]["count"] == 0
+    assert j["failing"] == []
+    # raw counts remain the unfiltered truth
+    assert j["raw_counts"]["error"]["broken_link"] == 2
+    assert j["ignored_counts"]["error"]["broken_link"] == 2
+
+
+def test_gate_priority_more_specific_path_wins_regardless_of_order(client):
+    _, vid, _ = import_and_validate(client, CORPUS)
+    # broad rule submitted first; the exact-path rule must claim the diagnosis
+    r = gate(
+        client,
+        vid,
+        {
+            "ignore_rules": [
+                {"path_glob": "docs/*"},            # 0: matches guide + api
+                {"path_glob": "docs/guide.md"},    # 1: more specific
+            ]
+        },
+    )
+    j = r.json()
+    hits = {m["rule_index"]: m["matched_count"] for m in j["matched_rules"]}
+    assert hits[0] == 2  # both docs/api.md diagnostics (deep.md is beyond '*')
+    assert hits[1] == 3  # all docs/guide.md diagnostics incl. its cycle member
+    winners = {(d["path"], d["type"]): d["ignored_by"] for d in j["ignored_diagnostics"]}
+    assert winners[("docs/guide.md", "broken_link")] == 1
+    assert ("docs/old/deep.md", "broken_anchor") not in winners
+
+    # and with the submission order flipped, priority must be identical
+    r2 = gate(
+        client,
+        vid,
+        {
+            "ignore_rules": [
+                {"path_glob": "docs/guide.md"},    # 0
+                {"path_glob": "docs/*"},            # 1
+            ]
+        },
+    )
+    j2 = r2.json()
+    assert {m["matched_count"] for m in j2["matched_rules"]} == {2, 3}
+    winners2 = {(d["path"], d["type"]): d["ignored_by"] for d in j2["ignored_diagnostics"]}
+    assert winners2[("docs/guide.md", "broken_link")] == 0
+
+
+def test_gate_priority_type_constraint_is_second_axis(client):
+    _, vid, _ = import_and_validate(client, CORPUS)
+    # same path specificity; the typed rule claims matching diagnostics even
+    # though it is submitted later
+    r = gate(
+        client,
+        vid,
+        {
+            "ignore_rules": [
+                {"path_glob": "docs/api.md"},                   # 0 untyped
+                {"path_glob": "docs/api.md", "type": "cycle"},  # 1 typed
+            ]
+        },
+    )
+    j = r.json()
+    hits = {m["rule_index"]: m["matched_count"] for m in j["matched_rules"]}
+    assert hits[1] == 1  # the cycle member
+    assert hits[0] == 1  # the broken anchor falls to the earlier untyped rule
+
+
+def test_gate_priority_request_order_is_final_tiebreaker(client):
+    _, vid, _ = import_and_validate(client, CORPUS)
+    r = gate(
+        client,
+        vid,
+        {
+            "ignore_rules": [
+                {"message_regex": "circular|anchor"},  # 0
+                {"message_regex": "."},                # 1 matches everything else
+            ]
+        },
+    )
+    j = r.json()
+    # equal specificity, neither typed: index 0 claims everything it matches
+    cycle_diags = [d for d in j["ignored_diagnostics"] if d["type"] == "cycle"]
+    assert cycle_diags and all(d["ignored_by"] == 0 for d in cycle_diags)
+
+
+def test_gate_message_regex_uses_search_not_fullmatch(client):
+    _, vid, _ = import_and_validate(client, CORPUS)
+    r = gate(client, vid, {"ignore_rules": [{"message_regex": r"^anchor '#install'"}]})
+    # the collision warning message starts with "anchor '#install' is shared..."
+    j = r.json()
+    assert j["matched_rules"][0]["matched_count"] == 1
+    assert j["ignored_diagnostics"][0]["type"] == "anchor_collision"
+
+
+def test_gate_glob_supports_double_star_segment(client):
+    corpus = {
+        "a.md": "# A\n\n[x](missing.md)\n",
+        "x/b.md": "# B\n\n[y](gone.md)\n",
+        "x/y/c.md": "# C\n\n[z](nope.md)\n",
+    }
+    _, vid, _ = import_and_validate(client, corpus)
+    r = gate(client, vid, {"ignore_rules": [{"path_glob": "**/*.md"}]})
+    # '**/*.md' spans zero or more segments: every document matches
+    j = r.json()
+    assert j["matched_rules"][0]["matched_count"] == 3
+    r = gate(client, vid, {"ignore_rules": [{"path_glob": "*/*.md"}]})
+    j = r.json()
+    # single '*' cannot cross '/'
+    assert {d["path"] for d in j["ignored_diagnostics"]} == {"x/b.md"}
+
+
+def test_gate_rejects_invalid_requests(client):
+    _, vid, _ = import_and_validate(client, CORPUS)
+
+    def expect_422(payload):
+        r = gate(client, vid, payload)
+        assert r.status_code == 422, (payload, r.status_code, r.text)
+        return r.json()["detail"]
+
+    assert "regex" in expect_422({"ignore_rules": [{"message_regex": "("}]})
+    assert "non-negative" in expect_422({"thresholds": {"broken_link": {"error": -1}}})
+    assert "integer" in expect_422({"thresholds": {"broken_link": {"error": 1.5}}})
+    assert "integer" in expect_422({"thresholds": {"broken_link": {"error": True}}})
+    assert "unknown diagnostic type" in expect_422(
+        {"thresholds": {"not_a_rule": {"error": 0}}}
+    )
+    assert "one of" in expect_422({"ignore_rules": [{"type": "not_a_rule"}]})
+    assert "at least one" in expect_422({"ignore_rules": [{}]})
+    # empty criteria strings are rejected by pydantic min_length
+    assert gate(client, vid, {"ignore_rules": [{"path_glob": ""}]}).status_code == 422
+    assert gate(client, vid, {"ignore_rules": [{"message_regex": ""}]}).status_code == 422
+    # pydantic-level shape errors also return 422
+    assert gate(client, vid, {"thresholds": []}).status_code == 422
+    assert gate(client, vid, {"ignore_rules": "x"}).status_code == 422
+    assert gate(client, vid, {"unknown_field": 1}).status_code == 422
+    assert gate(client, vid, {"thresholds": {"broken_link": "nope"}}).status_code == 422
+
+
+def test_gate_unknown_validation_returns_404(client):
+    r = client.post("/api/validations/does-not-exist/gate", json={})
+    assert r.status_code == 404
+    assert r.json()["detail"] == "validation not found"
+
+
+def test_gate_requires_done_status(client):
+    from app import db
+
+    _, done_id, _ = import_and_validate(client, CORPUS)
+    import_id = db.create_import({"a.md": "# A\n"})
+    pending_id = db.create_validation(import_id)  # stays 'pending'
+
+    r = gate(client, pending_id, {"thresholds": {"broken_link": {"error": 0}}})
+    assert r.status_code == 409
+    assert "pending" in r.json()["detail"]
+
+    db.set_validation_running(pending_id)
+    assert gate(client, pending_id, {}).status_code == 409
+
+    db.finish_validation(pending_id, "failed", error="boom")
+    r = gate(client, pending_id, {})
+    assert r.status_code == 409
+    assert "failed" in r.json()["detail"]
+
+
+def test_gate_glob_compiler_unit():
+    from app.gate import _compile_glob, _glob_specificity
+
+    def matches(pattern, path):
+        return bool(_compile_glob(pattern).match(path))
+
+    assert matches("docs/*.md", "docs/guide.md")
+    assert not matches("docs/*.md", "docs/guide/notes.md")
+    assert matches("docs/**/*.md", "docs/guide/notes.md")
+    assert matches("docs/**", "docs/guide/notes.md")
+    assert matches("**", "anything/at/all.md")
+    assert matches("a/**/b.md", "a/b.md")
+    assert matches("a/**/b.md", "a/x/y/b.md")
+    assert matches("a?c.md", "abc.md")
+    assert not matches("a?c.md", "a/c.md")
+    assert matches("a[0-9].md", "a7.md")
+    assert not matches("a[0-9].md", "ab.md")
+    assert matches("literal+file.md", "literal+file.md")  # regex chars escaped
+
+    assert _glob_specificity("docs/guide.md") > _glob_specificity("docs/*.md")
+    assert _glob_specificity("docs/*.md") > _glob_specificity("*.md")
+    assert _glob_specificity("*.md") > _glob_specificity("")
+

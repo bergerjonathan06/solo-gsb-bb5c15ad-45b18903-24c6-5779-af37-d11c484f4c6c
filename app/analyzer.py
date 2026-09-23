@@ -20,6 +20,9 @@ BROKEN_ANCHOR = "broken_anchor"
 ANCHOR_COLLISION = "anchor_collision"
 CYCLE = "cycle"
 
+# Canonical set of diagnostic type ids (also the stable SARIF rule order).
+DIAGNOSTIC_TYPES = (BROKEN_LINK, BROKEN_ANCHOR, ANCHOR_COLLISION, CYCLE)
+
 
 @dataclass
 class Diagnostic:

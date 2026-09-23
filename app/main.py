@@ -10,11 +10,14 @@ from . import db
 from .analyzer import analyze
 from .comparison import build_comparison
 from .fixer import build_fix_preview
+from .gate import GateRequestError, compile_gate_request, evaluate_gate
 from .sarif import build_sarif
 from .schemas import (
+    GateRequest,
     ImportRequest,
     ValidationCompareRequest,
     ValidationRequest,
+    gate_payload,
     normalize_doc_path,
 )
 
@@ -236,3 +239,17 @@ def fix_preview(validation_id: str) -> dict:
         "import_id": v["import_id"],
         **preview,
     }
+
+
+# ------------------------------------------------------------------- gate ---
+
+@app.post("/api/validations/{validation_id}/gate")
+def quality_gate(validation_id: str, req: GateRequest) -> dict:
+    """Evaluate error/warning thresholds with stable-priority ignore rules."""
+    v = _require_done_validation(validation_id, "quality gate evaluation")
+    try:
+        thresholds, rules = compile_gate_request(gate_payload(req))
+    except GateRequestError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    diagnostics = db.list_diagnostics(validation_id)
+    return evaluate_gate(validation_id, diagnostics, thresholds, rules)

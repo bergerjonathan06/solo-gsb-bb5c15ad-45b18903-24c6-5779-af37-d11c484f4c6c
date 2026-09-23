@@ -23,6 +23,9 @@ Markdown 文档，服务解析相对链接、标题锚点与代码块，建立�
 - **结果对比**：对两次 `done` 状态的校验，按稳定指纹（`type`、`severity`、
   `path`、`line`、`message`、`details`）计算新增 / 移除 / 未变化诊断，并报告
   两次导入之间文档的新增、删除与内容变化路径（`POST /api/validations/compare`）。
+- **质量门禁**：按诊断类型提交 error/warning 阈值与可忽略规则（类型、路径
+  glob、消息正则），服务以稳定优先级裁决每条诊断，返回 pass/fail、命中规则
+  与未通过诊断（`POST /api/validations/{validation_id}/gate`）。
 - **修复预览**：返回受影响文档的逐行变更与完整修复后内容，**不改写代码块与正文**：
   - 锚点碰撞 → 为重复标题补充显式锚点 `{#id}`（尽量保持原锚点值不变）；
   - 断锚 → 以最相似的目标锚点重写引用片段（相似度阈值 0.6）；
@@ -92,6 +95,7 @@ pytest
 | `POST` | `/api/validations/compare` | 对比两次校验的诊断与文档差异（均须为 `done`） |
 | `GET` | `/api/validations/{validation_id}/sarif` | SARIF 2.1.0 导出（任务须为 `done`） |
 | `POST` | `/api/validations/{validation_id}/fix-preview` | 修复预览（任务须为 `done`） |
+| `POST` | `/api/validations/{validation_id}/gate` | 质量门禁：阈值 + 忽略规则评估（任务须为 `done`） |
 
 ### 示例
 
@@ -123,6 +127,15 @@ curl -X POST localhost:8000/api/validations/compare \
 
 # 6. SARIF 2.1.0 导出（Content-Type: application/sarif+json）
 curl localhost:8000/api/validations/<validation_id>/sarif -o results.sarif
+
+# 7. 质量门禁：阈值 + 忽略规则
+curl -X POST localhost:8000/api/validations/<validation_id>/gate \
+  -H 'Content-Type: application/json' -d '{
+    "thresholds": {"broken_link": {"error": 0, "warning": 0}},
+    "ignore_rules": [
+      {"path_glob": "docs/old/**", "type": "broken_link"},
+      {"message_regex": "temporarily unreachable"}
+    ]}'
 ```
 
 修复预览响应：
@@ -212,6 +225,113 @@ VS Code SARIF Viewer 等工具：
 - 仅 `done` 状态可导出：校验不存在返回 `404`，`pending`/`running`/`failed`
   返回 `409` 并在 `detail` 中说明当前状态。
 
+## 质量门禁
+
+`POST /api/validations/{validation_id}/gate` 在校验的全部诊断上执行
+"先忽略、后卡阈值" 的门禁评估，任务须为 `done`。请求体两个字段均可选，
+空对象 `{}` 恒为通过：
+
+```json
+{
+  "thresholds": {
+    "broken_link":     {"error": 0},
+    "broken_anchor":   {"error": 0},
+    "anchor_collision":{"error": 0, "warning": 5},
+    "cycle":           {"warning": 2}
+  },
+  "ignore_rules": [
+    {"type": "broken_anchor", "path_glob": "docs/draft/**",
+     "message_regex": "^anchor '#wip-'"},
+    {"path_glob": "**/CHANGELOG.md"}
+  ]
+}
+```
+
+- **阈值 `thresholds`**：按诊断类型设置 `error` / `warning` 上限，两个级别
+  均可省略（省略表示该级别不设限）。忽略规则生效后的计数 **大于** 阈值即失败；
+  未配置阈值的类型不影响门禁结果。阈值必须是非负整数（布尔值、小数、负数均
+  返回 `422`），类型名必须是四种已知诊断之一。
+- **忽略规则 `ignore_rules`**：每条规则可组合 `type`（精确诊断类型）、
+  `path_glob`（文档路径 glob，POSIX 风格：`*` 不跨 `/`、`?` 单字符、
+  `**` 跨任意层级目录、`[abc]` 字符类）、`message_regex`（对诊断消息做
+  `re.search` 的 Python 正则）。所有给出的条件需同时满足（AND）；规则至少
+  设置其中一个字段。非法正则、未知类型或空条件返回 `422`。
+
+### 规则冲突裁决（稳定优先级）
+
+每条诊断只由 **优先级最高的一条匹配规则** 忽略，优先级按以下顺序比较：
+
+1. **路径更具体者优先**：路径段（`/` 分隔）更多、含通配符的段更少、字面字符
+   更多、通配符更少的 glob 更具体（如 `docs/guide.md` > `docs/*.md` > `*.md`）；
+   未设置 `path_glob` 的规则在路径维度最宽松。
+2. **类型约束次之**：路径相同时，限定了 `type` 的规则优先于未限定类型的规则。
+3. **提交顺序兜底**：前两者都相同的，请求数组中靠前的规则优先。
+
+匹配结果与请求顺序无关（交换规则顺序得到相同归属），仅在完全同具体度时
+顺序才作为最终裁决依据。
+
+### 响应
+
+响应同时给出原始计数、忽略后计数与逐条归属：
+
+- `status` / `passed`：`"pass"`/`"fail"` 及等价布尔值；
+- `raw_counts` / `ignored_counts`：按 `severity` → `type` 的原始与被忽略计数；
+- `counts`：`raw`、`ignored`、`effective`（忽略后剩余）总数；
+- `matched_rules`：实际命中的规则（`rule_index` 为提交下标），附条件回显与
+  `matched_count`，按下标升序；
+- `ignored_diagnostics`：被忽略的诊断（六字段公开投影）及 `ignored_by`
+  命中规则下标，按（路径、行号、类型、消息）排序；
+- `threshold_checks`：每个已配置（类型 + 级别）阈值的 `threshold`、忽略后
+  `count` 与 `pass`，按类型、级别排序；
+- `failing`：未通过的阈值桶，含 `threshold`、`count` 及该桶内 **未被忽略**
+  的诊断列表（文档级诊断排在最前）。
+
+```json
+{
+  "validation_id": "…",
+  "status": "fail",
+  "passed": false,
+  "raw_counts": {"error":   {"broken_link": 2, "broken_anchor": 2,
+                             "anchor_collision": 0, "cycle": 0},
+                 "warning": {"broken_link": 0, "broken_anchor": 0,
+                             "anchor_collision": 1, "cycle": 3}},
+  "ignored_counts": {"error":   {"broken_link": 1, "broken_anchor": 0,
+                                 "anchor_collision": 0, "cycle": 0},
+                     "warning": {"broken_link": 0, "broken_anchor": 0,
+                                 "anchor_collision": 0, "cycle": 3}},
+  "counts": {"raw": 8, "ignored": 4, "effective": 4},
+  "matched_rules": [
+    {"rule_index": 0, "type": "cycle", "path_glob": null,
+     "message_regex": null, "matched_count": 3},
+    {"rule_index": 1, "type": "broken_link", "path_glob": "docs/old/**",
+     "message_regex": null, "matched_count": 1}
+  ],
+  "ignored_diagnostics": [
+    {"type": "cycle", "severity": "warning", "path": "index.md", "line": null,
+     "message": "circular reference detected: …", "details": {"cycle": ["…"]},
+     "ignored_by": 0}
+  ],
+  "threshold_checks": [
+    {"type": "broken_link", "severity": "error",
+     "threshold": 0, "count": 1, "pass": false}
+  ],
+  "failing": [
+    {"type": "broken_link", "severity": "error", "threshold": 0, "count": 1,
+     "diagnostics": [
+       {"type": "broken_link", "severity": "error", "path": "index.md",
+        "line": 3, "message": "link target 'docs/nope.md' does not match …",
+        "details": {"target": "docs/nope.md", "resolved": "docs/nope.md"}}
+     ]}
+  ]
+}
+```
+
+校验不存在返回 `404`（`validation not found`）；`pending`/`running`/
+`failed` 返回 `409`；请求体结构错误（缺字段、类型错误、多余字段、超界）
+返回 `422`，语义错误（非法正则、负阈值、未知诊断类型、无任何条件的忽略
+规则）同样返回 `422` 并在 `detail` 中说明原因。门禁评估不修改校验数据，
+同一请求重复调用结果一致。
+
 ## 解析规则与已知限制
 
 - 锚点生成遵循 GitHub 规则：小写、去标点、空白转 `-`，重复标题自动追加 `-1`、`-2`；
@@ -234,6 +354,7 @@ app/
   comparison.py# 两次校验结果对比：诊断指纹差分 + 文档集合差分
   fixer.py     # 修复预览：最小化重写锚点与引用
   sarif.py     # SARIF 2.1.0 导出：诊断 -> runs/results 映射
+  gate.py      # 质量门禁：glob/正则忽略规则 + 阈值裁决
   db.py        # SQLite 持久层（imports / documents / validations / diagnostics）
   schemas.py   # 请求模型与路径校验
 tests/
